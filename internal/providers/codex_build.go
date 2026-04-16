@@ -135,6 +135,14 @@ func (p *CodexProvider) doRequest(ctx context.Context, body any) (io.ReadCloser,
 	}
 
 	endpoint := p.apiBase + "/codex/responses"
+	session := startBackendCapture("provider_http", string(data), map[string]any{
+		"direction": "request",
+		"transport": "provider_http",
+		"provider":  p.name,
+		"url":       endpoint,
+		"method":    "POST",
+		"payload":   string(data),
+	})
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("%s: create request: %w", p.name, err)
@@ -148,15 +156,50 @@ func (p *CodexProvider) doRequest(ctx context.Context, body any) (io.ReadCloser,
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("OpenAI-Beta", "responses=v1")
+	if session != nil {
+		session.appendTrafficEvent(map[string]any{
+			"direction": "request_headers",
+			"transport": "provider_http",
+			"provider":  p.name,
+			"headers":   headersToCaptureMap(httpReq.Header),
+		})
+	}
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
+		if session != nil {
+			session.appendTrafficEvent(map[string]any{
+				"direction": "response_error",
+				"transport": "provider_http",
+				"provider":  p.name,
+				"error":     err.Error(),
+			})
+		}
 		return nil, fmt.Errorf("%s: request failed: %w", p.name, err)
+	}
+	if session != nil {
+		session.appendTrafficEvent(map[string]any{
+			"direction":   "response_headers",
+			"transport":   "provider_http",
+			"provider":    p.name,
+			"status_code": resp.StatusCode,
+			"headers":     headersToCaptureMap(resp.Header),
+		})
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		if session != nil {
+			session.appendOutputChunk(respBody)
+			session.flushOutput("provider_http_error")
+			session.appendTrafficEvent(map[string]any{
+				"direction": "response_error_body",
+				"transport": "provider_http",
+				"provider":  p.name,
+				"payload":   string(respBody),
+			})
+		}
 		retryAfter := ParseRetryAfter(resp.Header.Get("Retry-After"))
 		return nil, &HTTPError{
 			Status:     resp.StatusCode,
@@ -165,7 +208,7 @@ func (p *CodexProvider) doRequest(ctx context.Context, body any) (io.ReadCloser,
 		}
 	}
 
-	return resp.Body, nil
+	return wrapBackendCaptureReadCloser(resp.Body, session, "provider_http_stream"), nil
 }
 
 // toFcID ensures a tool call ID starts with "fc_" and contains only

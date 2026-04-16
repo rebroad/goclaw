@@ -168,6 +168,14 @@ func (p *AnthropicProvider) doRequest(ctx context.Context, body any) (io.ReadClo
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: marshal request: %w", err)
 	}
+	session := startBackendCapture("provider_http", string(data), map[string]any{
+		"direction": "request",
+		"transport": "provider_http",
+		"provider":  p.name,
+		"url":       p.baseURL + "/messages",
+		"method":    "POST",
+		"payload":   string(data),
+	})
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
 	if err != nil {
@@ -184,15 +192,50 @@ func (p *AnthropicProvider) doRequest(ctx context.Context, body any) (io.ReadClo
 			httpReq.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
 		}
 	}
+	if session != nil {
+		session.appendTrafficEvent(map[string]any{
+			"direction": "request_headers",
+			"transport": "provider_http",
+			"provider":  p.name,
+			"headers":   headersToCaptureMap(httpReq.Header),
+		})
+	}
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
+		if session != nil {
+			session.appendTrafficEvent(map[string]any{
+				"direction": "response_error",
+				"transport": "provider_http",
+				"provider":  p.name,
+				"error":     err.Error(),
+			})
+		}
 		return nil, fmt.Errorf("anthropic: request failed: %w", err)
+	}
+	if session != nil {
+		session.appendTrafficEvent(map[string]any{
+			"direction":   "response_headers",
+			"transport":   "provider_http",
+			"provider":    p.name,
+			"status_code": resp.StatusCode,
+			"headers":     headersToCaptureMap(resp.Header),
+		})
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if session != nil {
+			session.appendOutputChunk(respBody)
+			session.flushOutput("provider_http_error")
+			session.appendTrafficEvent(map[string]any{
+				"direction": "response_error_body",
+				"transport": "provider_http",
+				"provider":  p.name,
+				"payload":   string(respBody),
+			})
+		}
 		retryAfter := ParseRetryAfter(resp.Header.Get("Retry-After"))
 		return nil, &HTTPError{
 			Status:     resp.StatusCode,
@@ -201,7 +244,7 @@ func (p *AnthropicProvider) doRequest(ctx context.Context, body any) (io.ReadClo
 		}
 	}
 
-	return resp.Body, nil
+	return wrapBackendCaptureReadCloser(resp.Body, session, "provider_http_stream"), nil
 }
 
 func (p *AnthropicProvider) parseResponse(resp *anthropicResponse) *ChatResponse {
